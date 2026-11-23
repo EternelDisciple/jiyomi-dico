@@ -1,0 +1,169 @@
+# Jiyomi pour Mac (23 nov. 2026) : l'app PC construite sur un Mac de GitHub, signée et notarisée par Apple, puis
+# déposée dans la release « pc » de ce dépôt, à côté des paquets Windows et Linux.
+#
+# Pourquoi ici et pas dans le dépôt de l'app : ce dépôt est public, et un Mac de GitHub y est gratuit (il compte dix
+# fois plus dans un dépôt privé). Le code de l'app reste privé : il est copié le temps de la build avec un jeton en
+# lecture seule (secret JIYOMI_SOURCE), sans être affiché ni gardé. Ce fichier ne contient aucun secret.
+#
+# Lancé seulement à la main (Actions → Jiyomi pour Mac → Run workflow), avec l'accord de Dorian pour chaque build.
+#
+# Secrets de ce dépôt :
+#   JIYOMI_SOURCE            jeton GitHub « fine-grained », lecture seule du contenu de EternelDisciple/jiyomi
+#   GOOGLE_BUREAU_SECRET     le même que dans le dépôt de l'app (connexion Google du PC)
+#   MAC_CERTIFICAT           le certificat « Developer ID Application » exporté en .p12, encodé en base64
+#   MAC_CERTIFICAT_MDP       le mot de passe de ce .p12
+#   APPLE_API_CLE            le contenu du fichier AuthKey_XXXX.p8 (clé d'API App Store Connect)
+#   APPLE_API_CLE_ID         son identifiant (Key ID)
+#   APPLE_API_EMETTEUR       l'Issuer ID de la page des clés d'App Store Connect
+# Sans MAC_CERTIFICAT : une app d'essai, signée « ad hoc », qui n'est PAS publiée (artefact de 3 jours seulement) :
+# macOS la bloque au premier lancement, elle sert à un testeur qui sait la débloquer.
+name: Jiyomi pour Mac
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branche ou commit de l'app à construire"
+        default: main
+      version:
+        description: "Numéro de version (vide : celui de la dernière build PC, lu dans latest-linux.yml)"
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mac
+  cancel-in-progress: false
+
+jobs:
+  mac:
+    name: Mac à puce Apple (.dmg, .zip de mise à jour)
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - name: Le code de l'app (dépôt privé, lecture seule)
+        uses: actions/checkout@v4
+        with:
+          repository: EternelDisciple/jiyomi
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.JIYOMI_SOURCE }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Le « code secret » du client Google de bureau, posé dans la copie de travail
+        env:
+          SECRET: ${{ secrets.GOOGLE_BUREAU_SECRET }}
+        run: |
+          if [ -n "$SECRET" ]; then
+            node -e 'const fs=require("fs"),f="src/lib/connexion-web.ts",s=fs.readFileSync(f,"utf8"),t=s.replace(/googleBureauSecret: "[^"]*"|googleBureauSecret: \x27[^\x27]*\x27/,"googleBureauSecret: "+JSON.stringify(process.env.SECRET));if(t===s)throw new Error("googleBureauSecret introuvable");fs.writeFileSync(f,t)'
+            echo "posé"
+          else echo "absent : la connexion Google du PC n'enverra pas de secret"; fi
+      - name: Installer la racine
+        run: npm ci --ignore-scripts
+      - name: Installer pc/
+        working-directory: pc
+        run: npm ci
+      - name: Tests du code partagé (tools/tests.mjs)
+        run: npm test
+      - name: "Vérifier les types (les tests propres au PC lancent dbus-daemon : ils tournent dans la build Linux)"
+        working-directory: pc
+        run: npm run typecheck && node outils/test-menu.mjs && node outils/test-ecran-mac.mjs && node outils/test-mise-a-jour.mjs
+      - name: Le numéro de version (celui de la dernière build PC, sauf s'il est donné)
+        working-directory: pc
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "$VERSION" ]; then
+            VERSION=$(curl -fsSL "https://github.com/${{ github.repository }}/releases/download/pc/latest-linux.yml" | sed -n 's/^version: *//p')
+          fi
+          echo "version $VERSION"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+      - name: Les modèles PP-OCR
+        working-directory: pc
+        run: npm run modeles
+      - name: Les dictionnaires
+        working-directory: pc
+        run: npm run dico
+      - name: Le certificat et la clé d'Apple (si posés)
+        id: apple
+        env:
+          MAC_CERTIFICAT: ${{ secrets.MAC_CERTIFICAT }}
+          APPLE_API_CLE: ${{ secrets.APPLE_API_CLE }}
+        run: |
+          set -euo pipefail
+          if [ -n "$MAC_CERTIFICAT" ]; then
+            echo "signee=1" >> "$GITHUB_OUTPUT"
+            printf '%s' "$APPLE_API_CLE" > "$RUNNER_TEMP/AuthKey.p8"
+            echo "Signature et notarisation : oui"
+          else
+            echo "signee=" >> "$GITHUB_OUTPUT"
+            echo "::warning::Pas de certificat Apple (MAC_CERTIFICAT) : app d'essai signée ad hoc, non publiée."
+          fi
+      - name: Construire l'app (signée et notarisée si le certificat est là)
+        working-directory: pc
+        env:
+          CSC_LINK: ${{ secrets.MAC_CERTIFICAT }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTIFICAT_MDP }}
+          APPLE_API_KEY: ${{ steps.apple.outputs.signee && format('{0}/AuthKey.p8', runner.temp) || '' }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_CLE_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_EMETTEUR }}
+        run: |
+          set -euo pipefail
+          npm run construire && npm run icone
+          if [ -n "${{ steps.apple.outputs.signee }}" ]; then
+            npx electron-builder --mac --publish never
+          else
+            CSC_IDENTITY_AUTO_DISCOVERY=false npx electron-builder --mac --publish never -c.mac.identity=-
+          fi
+          ls -la sortie
+      - name: L'app construite démarre et lit (essai de l'app dépaquetée)
+        working-directory: pc
+        run: node outils/essai-paquet.mjs
+      - name: La signature et la notarisation tiennent
+        if: steps.apple.outputs.signee
+        working-directory: pc
+        run: |
+          set -euo pipefail
+          app="sortie/mac-arm64/Jiyomi.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl --assess --type execute --verbose=4 "$app"
+          xcrun stapler validate "$app"
+          grep -q "mac-arm64.zip" sortie/latest-mac.yml || { echo "::error::latest-mac.yml ne nomme pas le .zip"; exit 1; }
+      - name: L'app d'essai (sans certificat), gardée trois jours
+        if: ${{ !steps.apple.outputs.signee }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: jiyomi-mac-essai
+          path: pc/sortie/*.dmg
+          retention-days: 3
+      - name: Publier dans la release « pc » (seulement les fichiers du Mac)
+        if: steps.apple.outputs.signee
+        working-directory: pc/sortie
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPOT: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Les fichiers du Mac seulement : ceux de Windows et Linux, déposés par la build PC, ne sont pas touchés.
+          est_mac() { case "$1" in *.dmg|*.dmg.blockmap|*-mac-*.zip|*-mac-*.zip.blockmap|latest-mac.yml) true ;; *) false ;; esac; }
+          nouveaux=$(ls | while read -r f; do est_mac "$f" && echo "$f"; done)
+          echo "à publier : $nouveaux"
+          for f in $(gh release view pc --repo "$DEPOT" --json assets --jq '.assets[].name'); do
+            est_mac "$f" && gh release delete-asset pc "$f" --repo "$DEPOT" --yes || true
+          done
+          # Les sommes : celles des autres fichiers gardées, celles du Mac refaites.
+          gh release download pc --repo "$DEPOT" --pattern SHA256SUMS --output /tmp/sommes 2>/dev/null || : > /tmp/sommes
+          grep -vE '  (.*\.dmg|.*\.dmg\.blockmap|.*-mac-.*\.zip|.*-mac-.*\.zip\.blockmap|latest-mac\.yml)$' /tmp/sommes > SHA256SUMS || true
+          shasum -a 256 $nouveaux >> SHA256SUMS
+          gh release upload pc $nouveaux SHA256SUMS --repo "$DEPOT" --clobber
+          echo "L'app Mac est à https://github.com/$DEPOT/releases/tag/pc ; le site la propose : https://jiyomi.app/telecharger/mac"
+      - name: Vérifier que « latest » est toujours le dictionnaire
+        if: steps.apple.outputs.signee
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest=$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name)
+          case "$latest" in dico-*) echo "latest : $latest" ;; *) echo "::error::« latest » n'est plus le dictionnaire ($latest)"; exit 1 ;; esac
