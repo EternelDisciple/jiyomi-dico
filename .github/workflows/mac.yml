@@ -91,12 +91,30 @@ jobs:
         id: apple
         env:
           MAC_CERTIFICAT: ${{ secrets.MAC_CERTIFICAT }}
+          MAC_CERTIFICAT_MDP: ${{ secrets.MAC_CERTIFICAT_MDP }}
           APPLE_API_CLE: ${{ secrets.APPLE_API_CLE }}
         run: |
           set -euo pipefail
           if [ -n "$MAC_CERTIFICAT" ]; then
             echo "signee=1" >> "$GITHUB_OUTPUT"
             printf '%s' "$APPLE_API_CLE" > "$RUNNER_TEMP/AuthKey.p8"
+            # Le certificat va dans un trousseau à nous (24 nov. : celui qu'electron-builder crée lui-même refusait
+            # de s'ouvrir sur le Mac de GitHub, « SecKeychainUnlock »). Méthode de la documentation de GitHub.
+            p12="$RUNNER_TEMP/certificat.p12"
+            trousseau="$RUNNER_TEMP/jiyomi.keychain-db"
+            mdp_trousseau="$(openssl rand -base64 24)"
+            echo "::add-mask::$mdp_trousseau"
+            printf '%s' "$MAC_CERTIFICAT" | base64 --decode > "$p12"
+            security create-keychain -p "$mdp_trousseau" "$trousseau"
+            security set-keychain-settings -lut 21600 "$trousseau"
+            security unlock-keychain -p "$mdp_trousseau" "$trousseau"
+            security import "$p12" -P "$MAC_CERTIFICAT_MDP" -A -t cert -f pkcs12 -k "$trousseau"
+            security set-key-partition-list -S apple-tool:,apple: -s -k "$mdp_trousseau" "$trousseau" > /dev/null
+            security list-keychains -d user -s "$trousseau" $(security list-keychains -d user | tr -d '"')
+            rm -f "$p12"
+            echo "trousseau=$trousseau" >> "$GITHUB_OUTPUT"
+            security find-identity -v -p codesigning "$trousseau" | grep -q "Developer ID Application" \
+              || { echo "::error::Le .p12 ne contient pas d'identité « Developer ID Application » utilisable."; exit 1; }
             echo "Signature et notarisation : oui"
           else
             echo "signee=" >> "$GITHUB_OUTPUT"
@@ -105,8 +123,7 @@ jobs:
       - name: Construire l'app (signée et notarisée si le certificat est là)
         working-directory: pc
         env:
-          CSC_LINK: ${{ secrets.MAC_CERTIFICAT }}
-          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTIFICAT_MDP }}
+          CSC_KEYCHAIN: ${{ steps.apple.outputs.trousseau }}
           APPLE_API_KEY: ${{ steps.apple.outputs.signee && format('{0}/AuthKey.p8', runner.temp) || '' }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_CLE_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_EMETTEUR }}
@@ -114,7 +131,7 @@ jobs:
           set -euo pipefail
           npm run construire && npm run icone
           if [ -n "${{ steps.apple.outputs.signee }}" ]; then
-            npx electron-builder --mac --publish never
+            npx electron-builder --mac --publish never -c.forceCodeSigning=true
           else
             CSC_IDENTITY_AUTO_DISCOVERY=false npx electron-builder --mac --publish never -c.mac.identity=-
           fi
