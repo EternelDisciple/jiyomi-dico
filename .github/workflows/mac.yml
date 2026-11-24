@@ -189,7 +189,8 @@ jobs:
           set -euo pipefail
           # Les fichiers du Mac seulement : ceux de Windows et Linux, déposés par la build PC, ne sont pas touchés.
           est_mac() { case "$1" in *.dmg|*.dmg.blockmap|*-mac-*.zip|*-mac-*.zip.blockmap|latest-mac.yml) true ;; *) false ;; esac; }
-          nouveaux=$(ls | while read -r f; do est_mac "$f" && echo "$f"; done)
+          # (un « if » et pas « est_mac && echo » : sous pipefail, le dernier fichier non Mac faisait échouer l'étape, 24 nov.)
+          nouveaux=$(for f in *; do if est_mac "$f"; then echo "$f"; fi; done)
           echo "à publier : $nouveaux"
           for f in $(gh release view pc --repo "$DEPOT" --json assets --jq '.assets[].name'); do
             est_mac "$f" && gh release delete-asset pc "$f" --repo "$DEPOT" --yes || true
