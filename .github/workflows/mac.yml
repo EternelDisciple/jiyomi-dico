@@ -120,6 +120,29 @@ jobs:
             echo "signee=" >> "$GITHUB_OUTPUT"
             echo "::warning::Pas de certificat Apple (MAC_CERTIFICAT) : app d'essai signée ad hoc, non publiée."
           fi
+      - name: La clé d'API d'Apple est acceptée (essai en quelques secondes, avant la build)
+        if: steps.apple.outputs.signee
+        env:
+          CLE_ID: ${{ secrets.APPLE_API_CLE_ID }}
+          EMETTEUR: ${{ secrets.APPLE_API_EMETTEUR }}
+        run: |
+          set -uo pipefail
+          cle="$RUNNER_TEMP/AuthKey.p8"
+          # Seulement la forme des valeurs, jamais les valeurs elles-mêmes.
+          head -1 "$cle" | grep -q -- "-----BEGIN PRIVATE KEY-----" && echo "Fichier .p8 : commence bien par BEGIN PRIVATE KEY" || echo "::warning::Fichier .p8 : la première ligne n'est pas « -----BEGIN PRIVATE KEY----- »"
+          tail -1 "$cle" | grep -q -- "-----END PRIVATE KEY-----" && echo "Fichier .p8 : finit bien par END PRIVATE KEY" || echo "::warning::Fichier .p8 : la dernière ligne n'est pas « -----END PRIVATE KEY----- »"
+          echo "Fichier .p8 : $(wc -l < "$cle" | tr -d ' ') lignes"
+          echo "Key ID : ${#CLE_ID} caractères (10 attendus)$( [[ "$CLE_ID" =~ ^[A-Z0-9]{10}$ ]] && echo ', forme correcte' || echo ', forme inattendue')"
+          echo "Issuer ID : ${#EMETTEUR} caractères (36 attendus)$( [[ "$EMETTEUR" =~ ^[0-9a-f-]{36}$ ]] && echo ', forme correcte' || echo ', forme inattendue')"
+          if xcrun notarytool history --key "$cle" --key-id "$CLE_ID" --issuer "$EMETTEUR" > /dev/null 2>&1; then
+            echo "Clé d'équipe acceptée par Apple."
+          elif xcrun notarytool history --key "$cle" --key-id "$CLE_ID" > /dev/null 2>&1; then
+            echo "::error::Apple accepte la clé seulement SANS Issuer ID : c'est une clé « individuelle ». Il faut une clé d'équipe (onglet « Équipe » des clés d'API)."
+            exit 1
+          else
+            echo "::error::Apple refuse la clé d'API (401) : Key ID, Issuer ID ou fichier .p8 ne vont pas ensemble."
+            exit 1
+          fi
       - name: Construire l'app (signée et notarisée si le certificat est là)
         working-directory: pc
         env:
